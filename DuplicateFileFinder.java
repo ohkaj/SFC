@@ -5,21 +5,36 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.Map;
+import java.util.Set;
+import java.util.HashSet;
 import java.util.stream.Stream;
+import java.util.stream.Collectors;
 import javax.swing.*;
 import javax.swing.event.HyperlinkEvent;
 import javax.swing.event.HyperlinkListener;
 import java.awt.*;
 import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
+import java.awt.image.BufferedImage;
+import javax.imageio.ImageIO;
 import java.net.URI;
 
 public class DuplicateFileFinder {
     private static final int BUFFER_SIZE = 8192;
+    private static final Set<String> IMAGE_EXTENSIONS = Set.of(
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp"
+    );
     private Map<String, List<Path>> currentDuplicates = new HashMap<>();
+    private Map<String, List<Path>> visualDuplicates = new HashMap<>();
+    private Map<String, String> fileHashes = new HashMap<>();
+    private Map<String, String> imageDHashes = new HashMap<>();
+    private List<Path> allScannedFiles = new ArrayList<>();
     private JPanel resultPanel;
     private JScrollPane resultScrollPane;
     private List<JCheckBox> fileCheckBoxes = new ArrayList<>();
+    private JTextArea logArea;
+    private JPanel logPanel;
+    private boolean logVisible = false;
     
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> new DuplicateFileFinder().createAndShowGUI());
@@ -50,8 +65,14 @@ public class DuplicateFileFinder {
         deleteSelectedButton.setBackground(new Color(180, 50, 50));
         deleteSelectedButton.setForeground(Color.WHITE);
         
+        JButton toggleLogButton = new JButton("Show Log");
+        JButton exportLogButton = new JButton("Export Log");
+        exportLogButton.setEnabled(false);
+        
         buttonPanel.add(scanButton);
         buttonPanel.add(deleteSelectedButton);
+        buttonPanel.add(toggleLogButton);
+        buttonPanel.add(exportLogButton);
         
         topPanel.add(folderPanel, BorderLayout.NORTH);
         topPanel.add(buttonPanel, BorderLayout.SOUTH);
@@ -64,10 +85,27 @@ public class DuplicateFileFinder {
         resultScrollPane.getVerticalScrollBar().setUnitIncrement(16);
         resultScrollPane.getVerticalScrollBar().setBlockIncrement(64);
         
+        // Create log panel
+        logArea = new JTextArea(10, 0);
+        logArea.setEditable(false);
+        logArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
+        logArea.setBackground(new Color(248, 248, 248));
+        JScrollPane logScrollPane = new JScrollPane(logArea);
+        
+        logPanel = new JPanel(new BorderLayout());
+        logPanel.setBorder(BorderFactory.createTitledBorder("Selected Files Log"));
+        logPanel.add(logScrollPane, BorderLayout.CENTER);
+        logPanel.setVisible(false);
+        
+        // Create split pane for results and log
+        JSplitPane splitPane = new JSplitPane(JSplitPane.VERTICAL_SPLIT, resultScrollPane, logPanel);
+        splitPane.setDividerLocation(400);
+        splitPane.setResizeWeight(0.7);
+        
         displayMessage("Select a folder and click 'Find Duplicates' to start scanning.");
         
         mainPanel.add(topPanel, BorderLayout.NORTH);
-        mainPanel.add(resultScrollPane, BorderLayout.CENTER);
+        mainPanel.add(splitPane, BorderLayout.CENTER);
         
         browseButton.addActionListener(e -> {
             JFileChooser chooser = new JFileChooser();
@@ -96,6 +134,9 @@ public class DuplicateFileFinder {
             SwingWorker<String, String> worker = new SwingWorker<String, String>() {
                 @Override
                 protected String doInBackground() throws Exception {
+                    fileHashes.clear(); // Clear previous hashes
+                    imageDHashes.clear(); // Clear previous dHashes
+                    allScannedFiles.clear(); // Clear previous file list
                     publish("Scanning files in directory...");
                     Map<Long, List<Path>> sizeGroups = groupFilesBySize(folder.toPath());
                     Map<String, List<Path>> duplicates = new HashMap<>();
@@ -106,6 +147,7 @@ public class DuplicateFileFinder {
                     
                     for (List<Path> files : sizeGroups.values()) {
                         totalFiles += files.size();
+                        allScannedFiles.addAll(files); // Store all scanned files
                     }
                     
                     publish(String.format("Found %d files. Analyzing for duplicates...", totalFiles));
@@ -119,17 +161,55 @@ public class DuplicateFileFinder {
                             publish(String.format("Checking duplicates... (%d/%d groups)", processedGroups, totalGroups));
                             Map<String, List<Path>> hashGroups = groupFilesByHash(files);
                             for (Map.Entry<String, List<Path>> entry : hashGroups.entrySet()) {
+                                String hash = entry.getKey();
+                                // Store hash for ALL files, not just duplicates
+                                for (Path file : entry.getValue()) {
+                                    fileHashes.put(file.toString(), hash);
+                                }
+                                
                                 if (entry.getValue().size() > 1) {
                                     duplicates.put(entry.getKey(), entry.getValue());
                                     duplicateGroups++;
                                     duplicateFiles += entry.getValue().size();
                                 }
                             }
+                        } else {
+                            // Calculate hash for unique files too
+                            Path uniqueFile = files.get(0);
+                            try {
+                                String hash = calculateFileHash(uniqueFile);
+                                fileHashes.put(uniqueFile.toString(), hash);
+                            } catch (Exception e) {
+                                System.err.println("Error calculating hash for unique file: " + uniqueFile + " - " + e.getMessage());
+                            }
                         }
                     }
                     
+                    // Phase 2: Visual duplicate detection for images (excluding those already in exact duplicates)
+                    publish("Analyzing images for visual similarity...");
+                    
+                    // Get all files already in exact duplicate groups
+                    Set<String> exactDuplicateFiles = new HashSet<>();
+                    for (List<Path> files : duplicates.values()) {
+                        for (Path file : files) {
+                            exactDuplicateFiles.add(file.toString());
+                        }
+                    }
+                    
+                    // Filter image files, excluding those already found as exact duplicates
+                    List<Path> imageFiles = allScannedFiles.stream()
+                        .filter(file -> isImageFile(file) && !exactDuplicateFiles.contains(file.toString()))
+                        .collect(Collectors.toList());
+                    
+                    if (!imageFiles.isEmpty()) {
+                        visualDuplicates = findVisualDuplicates(imageFiles);
+                        publish(String.format("Found %d visual duplicate groups", visualDuplicates.size()));
+                    }
+                    
                     currentDuplicates = duplicates;
-                    deleteSelectedButton.setEnabled(!duplicates.isEmpty());
+                    boolean hasAnyDuplicates = !duplicates.isEmpty() || !visualDuplicates.isEmpty();
+                    deleteSelectedButton.setEnabled(hasAnyDuplicates);
+                    exportLogButton.setEnabled(hasAnyDuplicates);
                     return ""; // Results handled by displayResults()
                 }
                 
@@ -181,6 +261,16 @@ public class DuplicateFileFinder {
             deleteSelectedFiles(selectedFiles, frame, scanButton);
         });
         
+        toggleLogButton.addActionListener(e -> {
+            logVisible = !logVisible;
+            logPanel.setVisible(logVisible);
+            toggleLogButton.setText(logVisible ? "Hide Log" : "Show Log");
+            splitPane.setDividerLocation(logVisible ? 300 : 400);
+            frame.revalidate();
+        });
+        
+        exportLogButton.addActionListener(e -> exportLog(frame));
+        
         frame.add(mainPanel);
         frame.setVisible(true);
     }
@@ -219,7 +309,10 @@ public class DuplicateFileFinder {
         resultPanel.removeAll();
         fileCheckBoxes.clear();
         
-        if (currentDuplicates.isEmpty()) {
+        boolean hasExactDuplicates = !currentDuplicates.isEmpty();
+        boolean hasVisualDuplicates = !visualDuplicates.isEmpty();
+        
+        if (!hasExactDuplicates && !hasVisualDuplicates) {
             JLabel noResultsLabel = new JLabel("<html><h3>No duplicate files found.</h3></html>");
             noResultsLabel.setBorder(BorderFactory.createEmptyBorder(20, 20, 20, 20));
             resultPanel.add(noResultsLabel);
@@ -249,64 +342,196 @@ public class DuplicateFileFinder {
             resultPanel.add(selectAllPanel);
             
             int groupNum = 1;
-            for (Map.Entry<String, List<Path>> entry : currentDuplicates.entrySet()) {
-                List<Path> files = entry.getValue();
-                long fileSize = 0;
-                try {
-                    fileSize = Files.size(files.get(0));
-                } catch (IOException e) {
-                    fileSize = -1;
+            
+            // Display exact duplicates (same file hash)
+            if (hasExactDuplicates) {
+                JLabel exactLabel = new JLabel("<html><h4 style='color: blue;'>Exact Duplicates (Same Content):</h4></html>");
+                exactLabel.setBorder(BorderFactory.createEmptyBorder(10, 5, 5, 5));
+                resultPanel.add(exactLabel);
+                
+                for (Map.Entry<String, List<Path>> entry : currentDuplicates.entrySet()) {
+                    groupNum = addDuplicateGroup(entry.getValue(), groupNum, "Exact", false);
                 }
+            }
+            
+            // Display visual duplicates (similar images)
+            if (hasVisualDuplicates) {
+                JLabel visualLabel = new JLabel("<html><h4 style='color: green;'>Visual Duplicates (Similar Images):</h4></html>");
+                visualLabel.setBorder(BorderFactory.createEmptyBorder(10, 5, 5, 5));
+                resultPanel.add(visualLabel);
                 
-                JPanel groupPanel = new JPanel();
-                groupPanel.setLayout(new BoxLayout(groupPanel, BoxLayout.Y_AXIS));
-                groupPanel.setBorder(BorderFactory.createCompoundBorder(
-                    BorderFactory.createTitledBorder(
-                        String.format("Group %d (%d files, %s)", groupNum++, files.size(), formatFileSize(fileSize))),
-                    BorderFactory.createEmptyBorder(2, 5, 2, 5)));
-                
-                for (int i = 0; i < files.size(); i++) {
-                    Path file = files.get(i);
-                    JPanel filePanel = new JPanel(new BorderLayout());
-                    filePanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 25));
-                    filePanel.setPreferredSize(new Dimension(0, 25));
-                    
-                    JCheckBox checkbox = new JCheckBox();
-                    checkbox.setActionCommand(file.toString());
-                    if (i > 0) { // Pre-select duplicates (keep first file unchecked)
-                        checkbox.setSelected(true);
-                    }
-                    fileCheckBoxes.add(checkbox);
-                    
-                    JButton fileButton = new JButton(file.getFileName().toString());
-                    fileButton.setToolTipText(file.toString());
-                    fileButton.addActionListener(e -> openFileInExplorer(file.toString()));
-                    fileButton.setBorderPainted(false);
-                    fileButton.setContentAreaFilled(false);
-                    fileButton.setForeground(Color.BLUE);
-                    fileButton.setHorizontalAlignment(SwingConstants.LEFT);
-                    fileButton.setPreferredSize(new Dimension(200, 20));
-                    
-                    JLabel pathLabel = new JLabel(file.getParent().toString());
-                    pathLabel.setFont(pathLabel.getFont().deriveFont(Font.PLAIN, 9f));
-                    pathLabel.setForeground(Color.GRAY);
-                    
-                    JPanel leftPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 2, 2));
-                    leftPanel.add(checkbox);
-                    leftPanel.add(fileButton);
-                    
-                    filePanel.add(leftPanel, BorderLayout.WEST);
-                    filePanel.add(pathLabel, BorderLayout.CENTER);
-                    
-                    groupPanel.add(filePanel);
+                for (Map.Entry<String, List<Path>> entry : visualDuplicates.entrySet()) {
+                    groupNum = addDuplicateGroup(entry.getValue(), groupNum, "Visual", true);
                 }
-                
-                resultPanel.add(groupPanel);
             }
         }
         
         resultPanel.revalidate();
         resultPanel.repaint();
+        
+        // Update log after displaying results
+        updateLog();
+    }
+    
+    private int addDuplicateGroup(List<Path> files, int groupNum, String groupType, boolean isVisual) {
+        long fileSize = 0;
+        try {
+            fileSize = Files.size(files.get(0));
+        } catch (IOException e) {
+            fileSize = -1;
+        }
+        
+        JPanel groupPanel = new JPanel();
+        groupPanel.setLayout(new BoxLayout(groupPanel, BoxLayout.Y_AXIS));
+        String titleText = String.format("%s Group %d (%d files, %s)", groupType, groupNum, files.size(), formatFileSize(fileSize));
+        groupPanel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createTitledBorder(titleText),
+            BorderFactory.createEmptyBorder(2, 5, 2, 5)));
+        
+        for (int i = 0; i < files.size(); i++) {
+            Path file = files.get(i);
+            JPanel filePanel = new JPanel(new BorderLayout());
+            filePanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 25));
+            filePanel.setPreferredSize(new Dimension(0, 25));
+            
+            JCheckBox checkbox = new JCheckBox();
+            checkbox.setActionCommand(file.toString());
+            if (i > 0) { // Pre-select duplicates (keep first file unchecked)
+                checkbox.setSelected(true);
+            }
+            checkbox.addChangeListener(e -> updateLog());
+            fileCheckBoxes.add(checkbox);
+            
+            JButton fileButton = new JButton(file.getFileName().toString());
+            fileButton.setToolTipText(file.toString());
+            fileButton.addActionListener(e -> openFileInExplorer(file.toString()));
+            fileButton.setBorderPainted(false);
+            fileButton.setContentAreaFilled(false);
+            fileButton.setForeground(isVisual ? new Color(0, 120, 0) : Color.BLUE);
+            fileButton.setHorizontalAlignment(SwingConstants.LEFT);
+            fileButton.setPreferredSize(new Dimension(200, 20));
+            
+            JLabel pathLabel = new JLabel(file.getParent().toString());
+            pathLabel.setFont(pathLabel.getFont().deriveFont(Font.PLAIN, 9f));
+            pathLabel.setForeground(Color.GRAY);
+            
+            JPanel leftPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 2, 2));
+            leftPanel.add(checkbox);
+            leftPanel.add(fileButton);
+            
+            filePanel.add(leftPanel, BorderLayout.WEST);
+            filePanel.add(pathLabel, BorderLayout.CENTER);
+            
+            groupPanel.add(filePanel);
+        }
+        
+        resultPanel.add(groupPanel);
+        return groupNum + 1;
+    }
+    
+    private void updateLog() {
+        StringBuilder logContent = new StringBuilder();
+        logContent.append("ALL FILES LOG\n");
+        logContent.append("=============\n");
+        logContent.append(String.format("Generated: %s\n", java.time.LocalDateTime.now().toString()));
+        logContent.append("\nFormat: [STATUS] FILENAME | HASH | DHASH | FULL_PATH\n");
+        logContent.append("STATUS: [CHECKED] = Selected for deletion, [UNCHECKED] = Not selected, [UNIQUE] = No duplicates\n");
+        logContent.append("HASH: SHA-256 file content hash\n");
+        logContent.append("DHASH: Image perceptual hash (only for images)\n\n");
+        
+        List<String> allFiles = new ArrayList<>();
+        int checkedCount = 0;
+        int uncheckedCount = 0;
+        int uniqueCount = 0;
+        
+        // Get all checked file paths for quick lookup
+        Set<String> checkedFilePaths = new HashSet<>();
+        for (JCheckBox checkbox : fileCheckBoxes) {
+            if (checkbox.isSelected()) {
+                checkedFilePaths.add(checkbox.getActionCommand());
+            }
+        }
+        
+        // Get all duplicate file paths for quick lookup (both exact and visual)
+        Set<String> duplicateFilePaths = new HashSet<>();
+        for (List<Path> files : currentDuplicates.values()) {
+            for (Path file : files) {
+                duplicateFilePaths.add(file.toString());
+            }
+        }
+        for (List<Path> files : visualDuplicates.values()) {
+            for (Path file : files) {
+                duplicateFilePaths.add(file.toString());
+            }
+        }
+        
+        // Process all scanned files
+        for (Path file : allScannedFiles) {
+            String filePath = file.toString();
+            String hash = fileHashes.get(filePath);
+            String dHash = imageDHashes.get(filePath);
+            String fileName = file.getFileName().toString();
+            String status;
+            
+            if (checkedFilePaths.contains(filePath)) {
+                status = "[CHECKED]  ";
+                checkedCount++;
+            } else if (duplicateFilePaths.contains(filePath)) {
+                status = "[UNCHECKED]";
+                uncheckedCount++;
+            } else {
+                status = "[UNIQUE]   ";
+                uniqueCount++;
+            }
+            
+            String fileInfo = String.format("%s %s | %s | %s | %s", 
+                status, fileName, hash, 
+                (dHash != null ? dHash : "N/A"), filePath);
+            allFiles.add(fileInfo);
+        }
+        
+        if (allFiles.isEmpty()) {
+            logContent.append("No files scanned yet.\n");
+        } else {
+            logContent.append(String.format("Total files: %d (Checked: %d, Unchecked: %d, Unique: %d)\n\n", 
+                allFiles.size(), checkedCount, uncheckedCount, uniqueCount));
+            
+            // Sort files alphabetically by name for easier reading
+            allFiles.sort((a, b) -> {
+                String nameA = a.substring(a.indexOf(']') + 2).split(" \\| ")[0];
+                String nameB = b.substring(b.indexOf(']') + 2).split(" \\| ")[0];
+                return nameA.compareToIgnoreCase(nameB);
+            });
+            
+            int counter = 1;
+            for (String fileInfo : allFiles) {
+                logContent.append(String.format("%4d. %s\n", counter++, fileInfo));
+            }
+        }
+        
+        logArea.setText(logContent.toString());
+        logArea.setCaretPosition(0);
+    }
+    
+    private void exportLog(JFrame parent) {
+        JFileChooser fileChooser = new JFileChooser();
+        fileChooser.setDialogTitle("Export Log File");
+        String timestamp = java.time.LocalDateTime.now().toString().replaceAll(":", "-").substring(0, 19);
+        fileChooser.setSelectedFile(new File("duplicate_files_log_" + timestamp + ".txt"));
+        
+        if (fileChooser.showSaveDialog(parent) == JFileChooser.APPROVE_OPTION) {
+            File file = fileChooser.getSelectedFile();
+            try (java.io.FileWriter writer = new java.io.FileWriter(file)) {
+                writer.write(logArea.getText());
+                JOptionPane.showMessageDialog(parent, 
+                    "Log exported successfully to: " + file.getAbsolutePath(),
+                    "Export Complete", JOptionPane.INFORMATION_MESSAGE);
+            } catch (IOException ex) {
+                JOptionPane.showMessageDialog(parent, 
+                    "Error exporting log: " + ex.getMessage(),
+                    "Export Error", JOptionPane.ERROR_MESSAGE);
+            }
+        }
     }
     
     private void deleteSelectedFiles(List<Path> filesToDelete, JFrame parent, JButton scanButton) {
@@ -513,6 +738,117 @@ public class DuplicateFileFinder {
         }
         
         return hexString.toString();
+    }
+    
+    private boolean isImageFile(Path file) {
+        String fileName = file.getFileName().toString().toLowerCase();
+        return IMAGE_EXTENSIONS.stream().anyMatch(fileName::endsWith);
+    }
+    
+    private String calculateDHash(Path imagePath) throws Exception {
+        try {
+            BufferedImage image = ImageIO.read(imagePath.toFile());
+            if (image == null) {
+                throw new Exception("Could not read image: " + imagePath);
+            }
+            
+            // Resize to 9x8 for dHash (we need 9 columns to compare 8 differences)
+            BufferedImage resized = new BufferedImage(9, 8, BufferedImage.TYPE_BYTE_GRAY);
+            Graphics2D g = resized.createGraphics();
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            g.drawImage(image, 0, 0, 9, 8, null);
+            g.dispose();
+            
+            // Calculate dHash by comparing adjacent pixels
+            StringBuilder hash = new StringBuilder();
+            for (int y = 0; y < 8; y++) {
+                for (int x = 0; x < 8; x++) {
+                    int leftPixel = resized.getRGB(x, y) & 0xFF;
+                    int rightPixel = resized.getRGB(x + 1, y) & 0xFF;
+                    hash.append(leftPixel < rightPixel ? '1' : '0');
+                }
+            }
+            
+            // Convert binary string to hexadecimal
+            StringBuilder hexHash = new StringBuilder();
+            for (int i = 0; i < hash.length(); i += 4) {
+                String fourBits = hash.substring(i, Math.min(i + 4, hash.length()));
+                while (fourBits.length() < 4) fourBits += "0"; // Pad if needed
+                int value = Integer.parseInt(fourBits, 2);
+                hexHash.append(Integer.toHexString(value));
+            }
+            
+            return hexHash.toString();
+        } catch (Exception e) {
+            throw new Exception("Error calculating dHash for " + imagePath + ": " + e.getMessage());
+        }
+    }
+    
+    private int calculateHammingDistance(String hash1, String hash2) {
+        if (hash1.length() != hash2.length()) {
+            return Integer.MAX_VALUE;
+        }
+        
+        int distance = 0;
+        for (int i = 0; i < hash1.length(); i++) {
+            if (hash1.charAt(i) != hash2.charAt(i)) {
+                distance++;
+            }
+        }
+        return distance;
+    }
+    
+    private Map<String, List<Path>> findVisualDuplicates(List<Path> imageFiles) {
+        Map<String, List<Path>> visualDups = new HashMap<>();
+        
+        // Calculate dHash for all images
+        for (Path imageFile : imageFiles) {
+            try {
+                String dHash = calculateDHash(imageFile);
+                imageDHashes.put(imageFile.toString(), dHash);
+            } catch (Exception e) {
+                System.err.println("Error calculating dHash for: " + imageFile + " - " + e.getMessage());
+            }
+        }
+        
+        // Find similar images (Hamming distance <= 5 is considered similar)
+        List<Path> processedImages = new ArrayList<>();
+        for (Path imageFile : imageFiles) {
+            String currentHash = imageDHashes.get(imageFile.toString());
+            if (currentHash == null) continue;
+            
+            boolean foundGroup = false;
+            for (Map.Entry<String, List<Path>> entry : visualDups.entrySet()) {
+                String groupHash = entry.getKey();
+                if (calculateHammingDistance(currentHash, groupHash) <= 5) {
+                    entry.getValue().add(imageFile);
+                    foundGroup = true;
+                    break;
+                }
+            }
+            
+            if (!foundGroup && !processedImages.contains(imageFile)) {
+                List<Path> similarImages = new ArrayList<>();
+                similarImages.add(imageFile);
+                
+                // Find all similar images to this one
+                for (Path otherImage : imageFiles) {
+                    if (!otherImage.equals(imageFile) && !processedImages.contains(otherImage)) {
+                        String otherHash = imageDHashes.get(otherImage.toString());
+                        if (otherHash != null && calculateHammingDistance(currentHash, otherHash) <= 5) {
+                            similarImages.add(otherImage);
+                        }
+                    }
+                }
+                
+                if (similarImages.size() > 1) {
+                    visualDups.put(currentHash, similarImages);
+                }
+                processedImages.addAll(similarImages);
+            }
+        }
+        
+        return visualDups;
     }
     
     private String formatFileSize(long size) {

@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rm:*)",
+      "Bash(javac:*)",
+      "Bash(jar cfe:*)",
+      "Bash(java:*)",
+      "Bash(where jar)",
+      "Bash(\"%JAVA_HOME%\\bin\\jar\" cfe DuplicateFileFinder.jar DuplicateFileFinder *.class)",
+      "Bash(ls:*)"
+    ],
+    "deny": []
+  }
+}
